@@ -16,6 +16,14 @@ snapshot that carries the audio model is opened with it, muted.
 
     uv run python tools/usbrun.py SNAPSHOT [--port 7311] [--seconds N]
                                   [--save-on-exit PATH] [--no-realtime]
+                                  [--firmware SYX|DIR]
+
+An OS upgrade sent over the link runs as on the unit (emu/osupgrade.py): the
+OS writes the new container into the emulated SPI flash and resets, and the
+runner then boots that flash through the bootstrap and the updater, the
+cold boot, intro and settle, in a firmware folder of its own (about a
+minute), and carries on from there with the same card. The link stays up
+throughout; the port answers again once the new OS has settled.
 
 The DT2_* variables pick the firmware, as for every stage (emu/bootstrap.py
 FirmwarePaths.env()). Ctrl-C stops it cleanly: the card is flushed and, with
@@ -29,7 +37,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from emu import config, device as devices, panel, symbols, usbmidi
+from emu import config, device as devices, osupgrade, panel, symbols, usbmidi
 from emu.dtim import Dtims, Timers
 from emu.longrun import build, never_fake_set_posts, spin
 from emu.pit import INSTR_PER_SEC, Pits, intro_running
@@ -70,8 +78,8 @@ def open_machine(snapshot, syx=None):
                                                      int):
         kw.update(ssi0_request_hz=saved['request_hz'],
                   ssi0_profile=cfg['ssi_profile'])
-    # A boot through the bootstrap runs on the aliased DDR model, and its
-    # snapshots must reopen on it.
+    # A boot through the bootstrap (a reboot after an OS upgrade) runs on
+    # the aliased DDR model, and its snapshots must reopen on it.
     if isinstance(manifest.get('ddr'), int):
         kw['ddr'] = manifest['ddr']
     m, ev, st, pc, _inq, at = build(
@@ -114,33 +122,82 @@ def main(argv=None):
                     help='seconds between status lines')
     ap.add_argument('--png', metavar='PATH',
                     help='write the panel framebuffer here with each status line')
+    ap.add_argument('--firmware', action='append', default=[], metavar='SYX|DIR',
+                    help='OS files an upgrade may install: a reboot needs the '
+                         'file the flash was written from (the running one is '
+                         'always a candidate)')
+    ap.add_argument('--workdir', metavar='DIR',
+                    help='where a reboot builds its firmware folder (default: '
+                         'reboots/N beside the running firmware folder)')
+    ap.add_argument('--no-reboot', action='store_true',
+                    help='stop when the OS resets instead of booting the flash')
+    ap.add_argument('--flash-out', metavar='PATH',
+                    help='when the OS resets, write the flash here too')
     args = ap.parse_args(argv)
 
     current = {'usb': None}
 
     def put(data):
         usb = current['usb']
-        if usb is not None:         # nothing to take it until the machine is up
+        if usb is not None:         # between power-ons the port is gone
             usb.put(data)
     link = usbmidi.LinkServer(put, host=args.host, port=args.port)
     print('[usbrun] USB MIDI link on %s:%d' % (args.host, link.port), flush=True)
     stop = {'now': False}
     signal.signal(signal.SIGINT, lambda *_: stop.__setitem__('now', True))
     signal.signal(signal.SIGTERM, lambda *_: stop.__setitem__('now', True))
+    snapshot, syx, boots = args.snapshot, args.syx, 0
     try:
-        status = run(args.snapshot, args.syx, args, link, current, stop)
+        while True:
+            status, flash = run(snapshot, syx, args, link, current, stop)
+            if status != 'reset' or args.no_reboot or stop['now']:
+                return {'limit': 0, 'reset': 3}.get(status, 1)
+            boots += 1
+            image = flash.image()
+            if args.flash_out:
+                with open(args.flash_out, 'wb') as fh:
+                    fh.write(image)
+            old_syx = config.firmware(syx)
+            new_syx = osupgrade.find_firmware(
+                osupgrade.container_from_flash(image),
+                args.firmware + [old_syx, os.path.dirname(old_syx)])
+            if new_syx is None:
+                print('[usbrun] the flash holds an OS that none of the '
+                      '--firmware files holds; cannot boot it', flush=True)
+                return 3
+            # The bootstrap on the device: an OS upgrade does not change it.
+            with open(os.path.join(config.sections_dir(),
+                                   'section_2_DSP.bin'), 'rb') as fh:
+                boot_section = fh.read()
+            workdir = args.workdir or os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(old_syx))),
+                'reboots', str(boots))
+            print('[usbrun] restarting into %s' % os.path.basename(new_syx),
+                  flush=True)
+            t = time.time()
+
+            def progress(e):
+                if e.kind == 'done':
+                    print('[reboot] %s' % e.text, flush=True)
+            snapshot = osupgrade.reboot(
+                image, new_syx, workdir, card=os.environ.get('DT2_PLUSDRIVE'),
+                boot_section=boot_section, progress=progress,
+                log=lambda text: print(text, flush=True))
+            syx = os.environ['DT2_SYX']
+            print('[usbrun] up again after %.0f s: %s'
+                  % (time.time() - t, snapshot), flush=True)
     finally:
         link.close()
-    return 0 if status == 'limit' else 1
 
 
 def run(snapshot, syx, args, link, current, stop):
-    """Run `snapshot` until stopped. -> how the run ended."""
+    """One power-on, from `snapshot`. -> (status, FlashWrites)."""
     m, ev, st, pc, at, profile, dev = open_machine(snapshot, syx)
     usb = usbmidi.UsbMidi(sink=link.send)
     if not usb.install(m, at, profile, ev):
         raise SystemExit('[usbrun] this image has no USB MIDI hooks '
                          '(unresolved: %s)' % ', '.join(usb.missing))
+    flash = osupgrade.FlashWrites(m, ev)
     current['usb'] = usb
 
     pits, intro = timers_for(m, ev, profile, dev)
@@ -168,6 +225,11 @@ def run(snapshot, syx, args, link, current, stop):
         ips = pits.sources[0].ips
         pc, executed, status = spin(m, pc, max(BUDGET, ips // 200), pits=pits,
                                     fast=True, async_events=audio + (usb,))
+        if flash.reset:
+            print('[usbrun] the OS reset the processor after %d flash writes; %s'
+                  % (len(flash.writes), usb.report()), flush=True)
+            status = 'reset'
+            break
         if status != 'limit':
             print('[usbrun] HALTED: %s at pc=0x%08x after %dM instructions'
                   % (status, pc, (instrs + executed) // 1_000_000), flush=True)
@@ -195,6 +257,7 @@ def run(snapshot, syx, args, link, current, stop):
                         fh.write(panel.png_bytes(buf, scale=4))
     current['usb'] = None
 
+    # The card keeps what the OS wrote, across a reset too.
     esd = ev.get('esdhc')
     if esd is not None:
         esd.card.flush()
@@ -212,8 +275,9 @@ def run(snapshot, syx, args, link, current, stop):
                       components=components, manifest=ev.get('checkpoint_manifest'))
         os.replace(tmp, args.save_on_exit)
         print('[usbrun] session saved to %s' % args.save_on_exit, flush=True)
-    print('[usbrun] stopped; %s' % usb.report(), flush=True)
-    return status
+    if status != 'reset':
+        print('[usbrun] stopped; %s' % usb.report(), flush=True)
+    return status, flash
 
 
 if __name__ == '__main__':

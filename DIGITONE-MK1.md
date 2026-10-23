@@ -190,7 +190,7 @@ On the reference desktop, OS 1.43:
 | DSP thread | ~80% of a second core |
 | Output, factory pattern | RMS ~1.8k, peak ~6.7k (16-bit), silent at idle |
 
-## USB MIDI
+## USB MIDI and the OS upgrade
 
 The USB controller is not modelled, but the firmware's USB MIDI port is,
 at the edges of its USB MIDI class driver (`emu/usbmidi.py`):
@@ -228,6 +228,23 @@ in loopMIDI. Then, for example:
 python -m elkflash info --in-port "dn-emu usb out" --out-port "dn-emu usb in"
 ```
 
+**An OS upgrade** runs as on the unit (`emu/osupgrade.py`). The running OS
+gets `emu/bootrom.py`'s SPI flash and DSPI 0 models, sharing one image with
+the flash-read shortcut, and writes the new OS into it with its own driver
+(on a 1.43 to 1.44 upgrade: six 256 KB sector erases from 0x80000 and 2,580
+page programs). Then it soft-resets. `tools/usbrun.py` boots that flash as
+the device would: the bootstrap already on the device runs from it, loads
+the updater from the new OS, and the updater unpacks MAIN OS and starts it
+(`bootrom.boot(flash=...)`). From there the usual stages run (cold boot,
+intro, settle) in a firmware folder of their own, with the same +Drive, and
+the port answers again. The emulator runs an OS from its .syx, so the
+reboot needs the file the flash was written from (`--firmware`).
+
+Measured in WSL on a contributor's PC with `--no-realtime`: 1.43 to 1.44 with
+`elkflash upgrade --no-confirm` took 11 s to send, and 53 s until `elkflash
+info` reported 1.44. Paced to real time the send takes about four minutes,
+because the emulated CPU runs slower than the unit's.
+
 ## Known limits
 
 - **Digitone Keys.** Boot argument bit 19 (at 0x402292f0) selects the Keys
@@ -257,6 +274,7 @@ python -m elkflash info --in-port "dn-emu usb out" --out-port "dn-emu usb in"
 | `emu/edma_sw.py` | eDMA, including SSRT starts (channel 47) |
 | `tests/test_dsplink.py` | the DSP model on a synthetic section 7, no firmware |
 | `emu/usbmidi.py` | USB MIDI in and out, and the TCP link |
+| `emu/osupgrade.py` | the OS's flash writes, its reset, and the reboot |
 | `tools/usbrun.py` | a snapshot run headless with the USB MIDI link |
 | `tools/usbmidi_relay.py` | the link's host end: two MIDI ports |
 | `tests/test_usbmidi.py` | event packets and the post, no firmware |

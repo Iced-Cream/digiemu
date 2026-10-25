@@ -1368,6 +1368,13 @@ SYMBOLS = [
     ('usb_midi_parse', Sig(H(24, '14-17,20-23', '3:a048d70c', '4410073a3bbcf7bff102055b62231fa6'),
                            hi=DATA_HI), False),
     ('usb_rx_release', Sig(H(24, '', '0:7009222f', '27369769e084a72ea8d1812fae3eb50d')), False),
+    # Overbridge audio (emu/obaudio.py). The audio block interrupt hands each
+    # block's frames to ob_audio_frames(frames, side, count): `count` frames of
+    # twelve big-endian 32-bit samples (main L/R, tracks 1-4 L/R, input L/R),
+    # which it packs seven at a time into 0x170-byte transfers for the bulk IN
+    # endpoint 3. With no host streaming it returns at once. Found on Digitone
+    # 1.44 from the endpoint-queue calls.
+    ('ob_audio_frames', Sig(H(24, '18-21', '14:00384ab9', '364d71b23d5bec80f2279a11078feb6d')), False),
     # The Elektron screenshot request (RPC 0x04) hands a copy of the screen to
     # the display task and, unless the copy is already done, waits for it on
     # a semaphore the copy then posts: rpc_screen_wait is the done-flag test

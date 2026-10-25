@@ -37,7 +37,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from emu import config, device as devices, osupgrade, panel, symbols, usbmidi
+from emu import config, device as devices, obaudio, osupgrade, panel, symbols, usbmidi
 from emu.dtim import Dtims, Timers
 from emu.longrun import build, never_fake_set_posts, spin
 from emu.pit import INSTR_PER_SEC, Pits, intro_running
@@ -57,8 +57,24 @@ def saved_manifest(path):
         return {}
 
 
-def open_machine(snapshot, syx=None):
-    """-> (m, ev, st, pc, at, profile, device): built as the window builds."""
+def accelerated():
+    """-> True when this Unicorn has the digikit accelerators (as emu/gui.py's
+    _accelerated, which this cannot import: the window needs Tk)."""
+    try:
+        from emu import native
+        from emu.harness import native_ff1
+        from unicorn import UC_ARCH_M68K, UC_MODE_BIG_ENDIAN, Uc
+        probe = Uc(UC_ARCH_M68K, UC_MODE_BIG_ENDIAN)
+        return bool(native.budget_available(probe)
+                    and native.edma_available(probe) and native_ff1())
+    except Exception:                                   # noqa: BLE001
+        return False
+
+
+def open_machine(snapshot, syx=None, audio=False):
+    """-> (m, ev, st, pc, at, profile, device): built as the window builds.
+    `audio`: build the audio model even when the snapshot was saved without
+    it (the window's legacy upgrade), so the audio block interrupt runs."""
     dev = None
     try:
         dev, _fw = devices.identify(config.firmware(syx))
@@ -77,6 +93,12 @@ def open_machine(snapshot, syx=None):
     if cfg and isinstance(saved, dict) and isinstance(saved.get('request_hz'),
                                                      int):
         kw.update(ssi0_request_hz=saved['request_hz'],
+                  ssi0_profile=cfg['ssi_profile'])
+    elif cfg and audio:
+        hz = cfg['request_hz']
+        if not accelerated() and cfg['fallback_request_hz']:
+            hz = cfg['fallback_request_hz']
+        kw.update(ssi0_request_hz=hz, ssi0_legacy_upgrade=True,
                   ssi0_profile=cfg['ssi_profile'])
     # A boot through the bootstrap (a reboot after an OS upgrade) runs on
     # the aliased DDR model, and its snapshots must reopen on it.
@@ -133,6 +155,9 @@ def main(argv=None):
                     help='stop when the OS resets instead of booting the flash')
     ap.add_argument('--flash-out', metavar='PATH',
                     help='when the OS resets, write the flash here too')
+    ap.add_argument('--ob-audio-port', type=int, metavar='PORT',
+                    help='also serve the twelve Overbridge audio channels on this TCP '
+                         'port: 48 kHz frames of 12 big-endian int32 (emu/obaudio.py)')
     args = ap.parse_args(argv)
 
     current = {'usb': None}
@@ -142,6 +167,11 @@ def main(argv=None):
         if usb is not None:         # between power-ons the port is gone
             usb.put(data)
     link = usbmidi.LinkServer(put, host=args.host, port=args.port)
+    if args.ob_audio_port is not None:
+        current['ob_link'] = usbmidi.LinkServer(lambda data: None, host=args.host,
+                                                port=args.ob_audio_port)
+        print('[usbrun] Overbridge audio on %s:%d' % (args.host, current['ob_link'].port),
+              flush=True)
     print('[usbrun] USB MIDI link on %s:%d' % (args.host, link.port), flush=True)
     stop = {'now': False}
     signal.signal(signal.SIGINT, lambda *_: stop.__setitem__('now', True))
@@ -188,17 +218,26 @@ def main(argv=None):
                   % (time.time() - t, snapshot), flush=True)
     finally:
         link.close()
+        if current.get('ob_link') is not None:
+            current['ob_link'].close()
 
 
 def run(snapshot, syx, args, link, current, stop):
     """One power-on, from `snapshot`. -> (status, FlashWrites)."""
-    m, ev, st, pc, at, profile, dev = open_machine(snapshot, syx)
+    want_audio = current.get('ob_link') is not None
+    m, ev, st, pc, at, profile, dev = open_machine(snapshot, syx, audio=want_audio)
     usb = usbmidi.UsbMidi(sink=link.send)
     if not usb.install(m, at, profile, ev):
         raise SystemExit('[usbrun] this image has no USB MIDI hooks '
                          '(unresolved: %s)' % ', '.join(usb.missing))
     flash = osupgrade.FlashWrites(m, ev)
     current['usb'] = usb
+    ob = None
+    if current.get('ob_link') is not None:
+        ob = obaudio.ObAudio(sink=current['ob_link'].send)
+        if not ob.install(m, at, profile):
+            print('[usbrun] this image has no Overbridge audio hook: no audio', flush=True)
+            ob = None
 
     pits, intro = timers_for(m, ev, profile, dev)
     post_ips = getattr(dev, 'post_intro_ips', 0) or 4 * INSTR_PER_SEC
@@ -216,6 +255,23 @@ def run(snapshot, syx, args, link, current, stop):
     if audio:
         audio[0].batch = True
         audio[0].align(pits.now)
+        if want_audio:
+            # As the window renders: the eDMA bank and INTC0 software interrupts
+            # (which also clock the sequencer), the codec stream itself unused.
+            from emu import edma_sw, intfrc
+            audio = audio + (edma_sw.install_bank(m, ev), intfrc.install(m, ev))
+            audio[0].sink = lambda data: None
+            cfg = getattr(dev, 'audio', None) or {}
+            if cfg.get('ips') and accelerated():
+                for source in pits.sources:
+                    source.ips = cfg['ips']
+                audio[0].ips = cfg['ips']
+                dsp = ev.get('dspcpu')
+                if dsp is not None:
+                    dsp.start_thread()
+                    dsp.attach_dma(ev['edma_sw_bank'])
+    elif want_audio:
+        print('[usbrun] no audio model for this device: no Overbridge audio', flush=True)
 
     emulated = 0.0
     t0 = last = time.time()
@@ -247,9 +303,9 @@ def run(snapshot, syx, args, link, current, stop):
             break
         if time.time() - last >= args.report:
             last = time.time()
-            print('[usbrun] %.1f s emulated, %.0f%% of real time; %s'
+            print('[usbrun] %.1f s emulated, %.0f%% of real time; %s%s'
                   % (emulated, 100 * emulated / max(1e-9, last - t0),
-                     usb.report()), flush=True)
+                     usb.report(), '; ' + ob.report() if ob else ''), flush=True)
             if args.png and profile.fb_front is not None:
                 buf = panel.read(m, profile.fb_front)
                 if buf is not None:

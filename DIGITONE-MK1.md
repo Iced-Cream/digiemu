@@ -245,6 +245,26 @@ Measured in WSL on a contributor's PC with `--no-realtime`: 1.43 to 1.44 with
 info` reported 1.44. Paced to real time the send takes about four minutes,
 because the emulated CPU runs slower than the unit's.
 
+**DIN MIDI and the panel, headless.** `tools/usbrun.py --din-port PORT`
+serves the DIN MIDI ports on a second TCP link, raw MIDI bytes both ways
+(`emu/midi.py`: MidiIn on emulated time, MidiOut for what the OS sends).
+`--panel KEYS` presses front-panel keys once the run is up, through the panel
+link, by the device file's names (`GLOBAL,DOWN,YES`; `FUNC+YES` together).
+On stock 1.44 this sets MIDI CONFIG > PORT CONFIG > INPUT FROM and OUTPUT TO
+from USB (as a first boot leaves them) to MIDI+USB and returns to the main
+page:
+
+```sh
+--panel GLOBAL,DOWN,DOWN,DOWN,DOWN,YES,DOWN,YES,DOWN,DOWN,DOWN,RIGHT,DOWN,RIGHT,NO,NO,NO
+```
+
+Dump requests do not need it. On stock 1.44, from the settled snapshot,
+each request (`F0 00 20 3C 0D 00 <id> 01 01 00 00 00 00 05 F7`) was answered
+on the port it came in on, and only there, with INPUT FROM at USB as well as
+at MIDI+USB: one message of 24,006 bytes for pattern+kit (0x60 and 0x68 for
+the working one), 21,081 for a pattern (0x61, 0x69), 2,941 for a kit (0x62,
+0x6A) and 361 for a sound (0x63, 0x6B).
+
 ## Known limits
 
 - **Digitone Keys.** Boot argument bit 19 (at 0x402292f0) selects the Keys
@@ -275,6 +295,6 @@ because the emulated CPU runs slower than the unit's.
 | `tests/test_dsplink.py` | the DSP model on a synthetic section 7, no firmware |
 | `emu/usbmidi.py` | USB MIDI in and out, and the TCP link |
 | `emu/osupgrade.py` | the OS's flash writes, its reset, and the reboot |
-| `tools/usbrun.py` | a snapshot run headless with the USB MIDI link |
+| `tools/usbrun.py` | a snapshot run headless with the USB MIDI link (and DIN MIDI, panel keys) |
 | `tools/usbmidi_relay.py` | the link's host end: two MIDI ports |
 | `tests/test_usbmidi.py` | event packets and the post, no firmware |

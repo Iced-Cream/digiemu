@@ -16,7 +16,8 @@ snapshot that carries the audio model is opened with it, muted.
 
     uv run python tools/usbrun.py SNAPSHOT [--port 7311] [--seconds N]
                                   [--save-on-exit PATH] [--no-realtime]
-                                  [--firmware SYX|DIR]
+                                  [--firmware SYX|DIR] [--din-port PORT]
+                                  [--panel KEYS]
 
 An OS upgrade sent over the link runs as on the unit (emu/osupgrade.py): the
 OS writes the new container into the emulated SPI flash and resets, and the
@@ -24,6 +25,18 @@ runner then boots that flash through the bootstrap and the updater, the
 cold boot, intro and settle, in a firmware folder of its own (about a
 minute), and carries on from there with the same card. The link stays up
 throughout; the port answers again once the new OS has settled.
+
+--din-port puts the DIN MIDI ports on a second TCP link, the same raw MIDI
+byte stream each way: what a client sends goes into MIDI IN (emu/midi.py
+MidiIn, on emulated time) and what the firmware writes to MIDI OUT comes back
+(MidiOut). The firmware reads DIN input only when MIDI CONFIG > PORT CONFIG >
+INPUT FROM includes MIDI, and a first boot leaves it at USB.
+
+--panel presses front-panel keys once the run is up, through the panel link
+as the window does (emu/panelin.py): a comma-separated list of the device
+file's key names, each pressed and let go, A+B held together, so a stock OS
+can be set up (MIDI CONFIG, say) with nothing on the USB port. Only the first
+power-on gets them: what they set is the OS's own state from then on.
 
 The DT2_* variables pick the firmware, as for every stage (emu/bootstrap.py
 FirmwarePaths.env()). Ctrl-C stops it cleanly: the card is flushed and, with
@@ -37,7 +50,8 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from emu import config, device as devices, obaudio, osupgrade, panel, symbols, usbmidi
+from emu import (config, device as devices, midi, obaudio, osupgrade, panel, panelin,
+                 symbols, usbmidi)
 from emu.dtim import Dtims, Timers
 from emu.longrun import build, never_fake_set_posts, spin
 from emu.pit import INSTR_PER_SEC, Pits, intro_running
@@ -129,6 +143,38 @@ def timers_for(m, ev, profile, dev):
     return pits, intro
 
 
+# A press and a release each dwell this long, in emulated seconds (the
+# window's PANEL_DWELL_MS is of the same order): a menu key reacts to the press.
+PANEL_DWELL = 0.15
+
+
+def panel_keys(dev, text):
+    """'GLOBAL,DOWN,FUNC+YES' -> the wire messages: [bytes], press, release,
+    press, ... each one a whole button group's state (panelin.encode_buttons)."""
+    names = {name.upper(): code for code, name in getattr(dev, 'labels', {}).items()}
+    held, out = panelin.Held(dev), []
+    for key in (k.strip() for k in text.split(',')):
+        if not key:
+            continue
+        codes = []
+        for name in key.upper().split('+'):
+            if name not in names:
+                raise SystemExit('[usbrun] no panel key %r on %s (keys: %s)'
+                                 % (name, getattr(dev, 'name', 'this device'),
+                                    ', '.join(sorted(names))))
+            codes.append(names[name])
+        for press in (True, False):
+            msgs = [held.press(c) if press else held.release(c) for c in codes]
+            out.append(b''.join(panelin.encode_buttons(ch, mask)
+                                for ch, mask in dict(x for x in msgs if x).items()))
+    return out
+
+
+def din_report(din_in, din_out):
+    return 'DIN in %d B (%d delivered), out %d B' % (din_in.received, din_in.delivered,
+                                                     din_out.sent)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('snapshot')
@@ -158,9 +204,15 @@ def main(argv=None):
     ap.add_argument('--ob-audio-port', type=int, metavar='PORT',
                     help='also serve the twelve Overbridge audio channels on this TCP '
                          'port: 48 kHz frames of 12 big-endian int32 (emu/obaudio.py)')
+    ap.add_argument('--din-port', type=int, metavar='PORT',
+                    help='also serve the DIN MIDI ports on this TCP port: raw MIDI bytes '
+                         'both ways, into MIDI IN and out of MIDI OUT')
+    ap.add_argument('--panel', metavar='KEYS',
+                    help="front-panel keys to press once it runs, e.g. 'GLOBAL,DOWN,YES' "
+                         "(the device file's names; A+B together)")
     args = ap.parse_args(argv)
 
-    current = {'usb': None}
+    current = {'usb': None, 'din_in': None, 'panel': args.panel}
 
     def put(data):
         usb = current['usb']
@@ -171,6 +223,15 @@ def main(argv=None):
         current['ob_link'] = usbmidi.LinkServer(lambda data: None, host=args.host,
                                                 port=args.ob_audio_port)
         print('[usbrun] Overbridge audio on %s:%d' % (args.host, current['ob_link'].port),
+              flush=True)
+    if args.din_port is not None:
+        def din_put(data):
+            din = current['din_in']
+            if din is not None:     # between power-ons the port is gone
+                din.put(data)
+        current['din_link'] = usbmidi.LinkServer(din_put, host=args.host,
+                                                 port=args.din_port)
+        print('[usbrun] DIN MIDI link on %s:%d' % (args.host, current['din_link'].port),
               flush=True)
     print('[usbrun] USB MIDI link on %s:%d' % (args.host, link.port), flush=True)
     stop = {'now': False}
@@ -218,8 +279,9 @@ def main(argv=None):
                   % (time.time() - t, snapshot), flush=True)
     finally:
         link.close()
-        if current.get('ob_link') is not None:
-            current['ob_link'].close()
+        for name in ('ob_link', 'din_link'):
+            if current.get(name) is not None:
+                current[name].close()
 
 
 def run(snapshot, syx, args, link, current, stop):
@@ -238,6 +300,13 @@ def run(snapshot, syx, args, link, current, stop):
         if not ob.install(m, at, profile):
             print('[usbrun] this image has no Overbridge audio hook: no audio', flush=True)
             ob = None
+    din_in = din_out = None
+    if current.get('din_link') is not None:
+        din_in, din_out = midi.MidiIn(), midi.MidiOut(current['din_link'].send)
+        din_out.install(m)
+    din = tuple(x for x in (din_in, din_out) if x is not None)
+
+    keys = panel_keys(dev, current.pop('panel')) if current.get('panel') else []
 
     pits, intro = timers_for(m, ev, profile, dev)
     post_ips = getattr(dev, 'post_intro_ips', 0) or 4 * INSTR_PER_SEC
@@ -247,6 +316,9 @@ def run(snapshot, syx, args, link, current, stop):
             pits.release()
             for source in pits.sources:
                 source.ips = post_ips
+            for x in din:
+                x.set_ips(post_ips)
+            current['intro_done'] = True
         at(profile.intro_done, handover)
     else:
         for source in pits.sources:
@@ -272,7 +344,12 @@ def run(snapshot, syx, args, link, current, stop):
                     dsp.attach_dma(ev['edma_sw_bank'])
     elif want_audio:
         print('[usbrun] no audio model for this device: no Overbridge audio', flush=True)
+    for x in din:                   # on the timers' clock, as the window does
+        x.attach(m, pits.sources[0].ips)
+    current['din_in'] = din_in
 
+    current['intro_done'] = not intro
+    key_due = 1.0                   # emulated s: the first key once the UI runs
     emulated = 0.0
     t0 = last = time.time()
     instrs = 0
@@ -280,7 +357,7 @@ def run(snapshot, syx, args, link, current, stop):
     while not stop['now']:
         ips = pits.sources[0].ips
         pc, executed, status = spin(m, pc, max(BUDGET, ips // 200), pits=pits,
-                                    fast=True, async_events=audio + (usb,))
+                                    fast=True, async_events=audio + (usb,) + din)
         if flash.reset:
             print('[usbrun] the OS reset the processor after %d flash writes; %s'
                   % (len(flash.writes), usb.report()), flush=True)
@@ -292,6 +369,11 @@ def run(snapshot, syx, args, link, current, stop):
             break
         instrs += executed
         emulated += executed / ips
+        if keys and current['intro_done'] and emulated >= key_due:
+            pc = panelin.feed(m, profile, keys.pop(0))
+            key_due = emulated + PANEL_DWELL
+            if not keys:
+                print('[usbrun] panel keys pressed: %s' % args.panel, flush=True)
         if not args.no_realtime:
             # A step can credit far more than one chunk (an idle stretch
             # runs to the next timer), so sleep off all of the lead.
@@ -303,15 +385,17 @@ def run(snapshot, syx, args, link, current, stop):
             break
         if time.time() - last >= args.report:
             last = time.time()
-            print('[usbrun] %.1f s emulated, %.0f%% of real time; %s%s'
+            print('[usbrun] %.1f s emulated, %.0f%% of real time; %s%s%s'
                   % (emulated, 100 * emulated / max(1e-9, last - t0),
-                     usb.report(), '; ' + ob.report() if ob else ''), flush=True)
+                     usb.report(), '; ' + ob.report() if ob else '',
+                     '; ' + din_report(din_in, din_out) if din else ''), flush=True)
             if args.png and profile.fb_front is not None:
                 buf = panel.read(m, profile.fb_front)
                 if buf is not None:
                     with open(args.png, 'wb') as fh:
                         fh.write(panel.png_bytes(buf, scale=4))
     current['usb'] = None
+    current['din_in'] = None
 
     # The card keeps what the OS wrote, across a reset too.
     esd = ev.get('esdhc')
@@ -332,7 +416,8 @@ def run(snapshot, syx, args, link, current, stop):
         os.replace(tmp, args.save_on_exit)
         print('[usbrun] session saved to %s' % args.save_on_exit, flush=True)
     if status != 'reset':
-        print('[usbrun] stopped; %s' % usb.report(), flush=True)
+        print('[usbrun] stopped; %s%s' % (usb.report(), '; ' + din_report(din_in, din_out)
+                                          if din else ''), flush=True)
     return status, flash
 
 

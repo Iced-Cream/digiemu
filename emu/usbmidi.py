@@ -14,7 +14,8 @@ packets it built from the host's bytes in buffers of its own, so the
 firmware's parser, handlers, SysEx/RPC dispatch and semaphores all run as on
 the unit. It posts from the idle task, and from the parser's own task when
 the parser hands a buffer back. One post carries at most 128 packets, one
-high-speed bulk transfer (512 bytes), and at most four wait at once.
+high-speed bulk transfer (512 bytes), and only one is out at a time, as the
+unit's endpoint is primed again only once the parser hands its buffer back.
 
 Out. The class driver has two senders, each taking (length, pointer) to
 plain MIDI bytes: one packs a message stream into event packets and queues
@@ -52,10 +53,12 @@ SYMBOLS = ('usb_midi_send', 'usb_midi_send_short', 'usb_defer',
 # three MIDI bytes, so a post must not carry more.
 PACKETS = 128
 # The input buffers, as an offset from the short sender's 32-byte ring, and
-# how many transfers may wait in the deferred-call queue at once: four fill
-# the 2 KB from there to the next buffer the driver uses.
+# how many transfers may wait in the deferred-call queue at once. One: with
+# four, long data-store writes (8 KB SysEx blocks) arrived corrupt most of the
+# time ("Invalid package checksum"); with one, 4 of 4 passed and an OS upgrade
+# took as long as before.
 RX_OFFSET = 0x800
-BUFFERS = 4
+BUFFERS = 1
 CABLE = 0
 # The link's TCP port: analog-emu's Overbridge link uses 7301.
 DEFAULT_PORT = 7311

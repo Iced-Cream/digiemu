@@ -390,8 +390,17 @@ def run(snapshot, syx, args, link, current, stop):
                 waiting.pop(0)
             t0 += time.time() - took    # a save's seconds are not emulated time
         ips = pits.sources[0].ips
+        if supply is not None and not supply.up:
+            # Switched off: the OS masks every INTC source but its power-off ones (and
+            # quiets the codec). The audio, DSP and forced-INTC0 models bypass the mask
+            # registers, so they would still run handlers on the OS's power-off stack:
+            # only the supply and its forced INTC2 sources run from here on.
+            events = audio_extra
+            m.async_sources = ()
+        else:
+            events = audio + (usb,) + audio_extra
         pc, executed, status = spin(m, pc, max(BUDGET, ips // 200), pits=pits,
-                                    fast=True, async_events=audio + (usb,) + audio_extra)
+                                    fast=True, async_events=events)
         if supply is not None and not supply.up and status == 'limit':
             if off_by is None:
                 off_by = emulated + POWER_OFF_SECONDS

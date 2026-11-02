@@ -562,6 +562,17 @@ class Esdhc:
                          begin=BASE + XFERTYP, end=BASE + XFERTYP + 3)
         self.uc.hook_add(UC_HOOK_MEM_WRITE, self._on_datport_write,
                          begin=BASE + DATPORT, end=BASE + DATPORT + 3)
+        # IRQSTAT is write-1-to-clear: a store clears the bits written as 1
+        # and leaves the rest. Unicorn lands the store as plain memory after
+        # the write hook, so the hook works out what the register should hold
+        # and the read hook puts it back before the next read. Without it the
+        # OS's power-off save, which acks CC alone and then polls TC by hand,
+        # waited for ever: its store of CC cleared TC too.
+        self._irqstat = None
+        self.uc.hook_add(UC_HOOK_MEM_WRITE, self._on_irqstat_write,
+                         begin=BASE + IRQSTAT, end=BASE + IRQSTAT + 3)
+        self.uc.hook_add(UC_HOOK_MEM_READ, self._on_irqstat_read,
+                         begin=BASE + IRQSTAT, end=BASE + IRQSTAT + 3)
         # The driver arms an eDMA channel BEFORE issuing the command, so the
         # transfer has to run when the command is issued, not when SERQ is
         # written. emu/edma.py hooks the same byte for channel 35; Unicorn is
@@ -581,6 +592,8 @@ class Esdhc:
         of MB of host memory as a per-byte dict. An in-memory card (no path)
         has nowhere else to keep its bytes, so it still carries them.
         """
+        if getattr(self, '_irqstat', None) is not None:     # a w1c store not yet read back
+            self._put(IRQSTAT, self._irqstat)
         self.card.flush()
         if self.card.path:
             self.card.overlay = {}
@@ -717,9 +730,13 @@ class Esdhc:
 
     # -- register access -------------------------------------------------
     def _put(self, off, val):
+        if off == IRQSTAT:
+            self._irqstat = None
         self.uc.mem_write(BASE + off, struct.pack('>I', val & 0xFFFFFFFF))
 
     def _get(self, off):
+        if off == IRQSTAT and getattr(self, '_irqstat', None) is not None:
+            return self._irqstat
         return struct.unpack('>I', bytes(self.uc.mem_read(BASE + off, 4)))[0]
 
     def _set_bits(self, off, bits):
@@ -740,6 +757,18 @@ class Esdhc:
         cur = self._get(SYSCTL)
         if cur & (INITA | RSTA | RSTC | RSTD):
             self._put(SYSCTL, cur & ~(INITA | RSTA | RSTC | RSTD))
+
+    def _on_irqstat_write(self, uc, typ, addr, size, val, data):
+        """Write 1 to clear (see __init__); `val` has not landed yet."""
+        old = self._get(IRQSTAT) if self._irqstat is None else self._irqstat
+        shift = 8 * (BASE + IRQSTAT + 4 - addr - size)
+        mask = ((1 << (8 * size)) - 1) << shift
+        self._irqstat = old & ~(((val << shift) & mask)) & 0xFFFFFFFF
+
+    def _on_irqstat_read(self, uc, typ, addr, size, val, data):
+        if self._irqstat is not None:
+            self._put(IRQSTAT, self._irqstat)
+            self._irqstat = None
 
     def _on_xfertyp(self, uc, typ, addr, size, val, data):
         """Writing XFERTYP issues the command.

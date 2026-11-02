@@ -61,14 +61,15 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from emu import (config, device as devices, midi, obaudio, osupgrade, panel, panelin, sparse,
-                 symbols, usbmidi)
+from emu import (config, device as devices, midi, obaudio, osupgrade, panel, panelin, power,
+                 sparse, symbols, usbmidi)
 from emu.dtim import Dtims, Timers
 from emu.longrun import build, never_fake_set_posts, spin
 from emu.pit import INSTR_PER_SEC, Pits, intro_running
 from emu.snapshot import _SnapshotUnpickler, save as save_snapshot
 
 BUDGET = 400_000
+POWER_OFF_SECONDS = 5           # emulated: the OS's power-off save takes well under one
 CHUNK = 1 << 20
 
 
@@ -224,7 +225,12 @@ def main(argv=None):
                     help='stop after this much emulated time (0: run until Ctrl-C)')
     ap.add_argument('--save-on-exit')
     ap.add_argument('--stdin-commands', action='store_true',
-                    help='read commands from stdin, one per line (save [PATH])')
+                    help='read commands from stdin, one per line (save [PATH]; '
+                         'power-off, with --power-off)')
+    ap.add_argument('--power-off', action='store_true',
+                    help='model the supply: a power-off command on stdin switches it off '
+                         '(the OS runs its power-off save to the card), then the device '
+                         'boots again on that card, as switched on (emu/power.py)')
     ap.add_argument('--save-to', metavar='PATH',
                     help='where a save command with no PATH saves the machine')
     ap.add_argument('--no-realtime', action='store_true',
@@ -238,7 +244,7 @@ def main(argv=None):
                          'file the flash was written from (the running one is '
                          'always a candidate)')
     ap.add_argument('--workdir', metavar='DIR',
-                    help='where a reboot builds its firmware folder (default: '
+                    help='where reboots build their firmware folders, DIR/N for boot N (default: '
                          'reboots/N beside the running firmware folder)')
     ap.add_argument('--no-reboot', action='store_true',
                     help='stop when the OS resets instead of booting the flash')
@@ -260,7 +266,8 @@ def main(argv=None):
         current['commands'] = queue.Queue()
         threading.Thread(target=read_commands, args=(sys.stdin, current['commands']),
                          daemon=True).start()
-        print('[usbrun] commands on stdin: save', flush=True)
+        print('[usbrun] commands on stdin: save%s' % (', power-off' if args.power_off else ''),
+              flush=True)
 
     def put(data):
         usb = current['usb']
@@ -289,7 +296,7 @@ def main(argv=None):
     try:
         while True:
             status, flash = run(snapshot, syx, args, link, current, stop)
-            if status != 'reset' or args.no_reboot or stop['now']:
+            if status not in ('reset', 'power-off') or args.no_reboot or stop['now']:
                 return {'limit': 0, 'reset': 3}.get(status, 1)
             boots += 1
             image = flash.image()
@@ -308,10 +315,13 @@ def main(argv=None):
             with open(os.path.join(config.sections_dir(),
                                    'section_2_DSP.bin'), 'rb') as fh:
                 boot_section = fh.read()
-            workdir = args.workdir or os.path.join(
+            # A folder per boot: the reboot rebuilds its folder from scratch, and the
+            # card the running OS has just written may be in the previous boot's.
+            workdir = os.path.join(args.workdir, str(boots)) if args.workdir else os.path.join(
                 os.path.dirname(os.path.dirname(os.path.abspath(old_syx))),
                 'reboots', str(boots))
-            print('[usbrun] restarting into %s' % os.path.basename(new_syx),
+            print('[usbrun] %s %s' % ('switching on again into' if status == 'power-off'
+                                      else 'restarting into', os.path.basename(new_syx)),
                   flush=True)
             t = time.time()
 
@@ -361,6 +371,12 @@ def run(snapshot, syx, args, link, current, stop):
 
     keys = panel_keys(dev, current.pop('panel')) if current.get('panel') else []
 
+    supply = None
+    if args.power_off:
+        supply, forced = power.install(m, ev)
+        audio_extra = (supply, forced)
+    else:
+        audio_extra = ()
     pits, intro = timers_for(m, ev, profile, dev)
     post_ips = getattr(dev, 'post_intro_ips', 0) or 4 * INSTR_PER_SEC
     if intro:
@@ -430,7 +446,20 @@ def run(snapshot, syx, args, link, current, stop):
             return True
         print('[usbrun] saved %s' % path, flush=True)
         return True
-    commands = {'save': save}
+    def power_off():
+        """Switch the supply off. The run then ends when the OS's save is over."""
+        if supply is None:
+            print('[usbrun] power-off needs --power-off', flush=True)
+            return True
+        if not supply.armed:
+            print('[usbrun] power off: the OS has not armed its power sense; not switched off',
+                  flush=True)
+            return True
+        supply.cut()
+        print('[usbrun] power off: supply cut', flush=True)
+        return True
+    commands = {'save': save, 'power-off': power_off}
+    off_by = None                   # emulated seconds by which the save must be over
     while not stop['now']:
         q = current.get('commands')
         while q is not None and not waiting and not q.empty():
@@ -445,8 +474,33 @@ def run(snapshot, syx, args, link, current, stop):
                 waiting.pop(0)
             t0 += time.time() - took    # a save's seconds are not emulated time
         ips = pits.sources[0].ips
+        if supply is not None and not supply.up:
+            # Switched off: the OS masks every INTC source but its power-off ones (and
+            # quiets the codec). The audio, DSP and forced-INTC0 models bypass the mask
+            # registers, so they would still run handlers on the OS's power-off stack:
+            # only the supply and its forced INTC2 sources run from here on.
+            events = audio_extra
+            m.async_sources = ()
+        else:
+            events = audio + (usb,) + din + audio_extra
         pc, executed, status = spin(m, pc, max(BUDGET, ips // 200), pits=pits,
-                                    fast=True, async_events=audio + (usb,) + din)
+                                    fast=True, async_events=events)
+        if supply is not None and not supply.up and status == 'limit':
+            if off_by is None:
+                off_by = emulated + POWER_OFF_SECONDS
+            if supply.done or emulated >= off_by:
+                n = supply.blocks_written()
+                if not supply.done:
+                    print('[usbrun] power off: the OS did not finish its power-off save '
+                          'within %d s (%d blocks written)' % (POWER_OFF_SECONDS, n), flush=True)
+                elif n:
+                    print('[usbrun] power off: working state saved (%d blocks written)' % n,
+                          flush=True)
+                else:
+                    print('[usbrun] power off: the OS saved nothing (nothing changed since '
+                          'its last save)', flush=True)
+                status = 'power-off' if supply.done else 'halted'
+                break
         if flash.reset:
             print('[usbrun] the OS reset the processor after %d flash writes; %s'
                   % (len(flash.writes), usb.report()), flush=True)
@@ -493,7 +547,9 @@ def run(snapshot, syx, args, link, current, stop):
     if args.save_on_exit and status == 'limit':
         save_session(m, ev, st, pits, instrs, args.save_on_exit, 'saved on exit by tools/usbrun.py')
         print('[usbrun] session saved to %s' % args.save_on_exit, flush=True)
-    if status != 'reset':
+    if status == 'power-off':
+        print('[usbrun] power off: wrote card', flush=True)
+    elif status != 'reset':
         print('[usbrun] stopped; %s%s' % (usb.report(), '; ' + din_report(din_in, din_out)
                                           if din else ''), flush=True)
     return status, flash

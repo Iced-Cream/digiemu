@@ -173,3 +173,30 @@ class EsdhcCheckpointCardTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IrqstatWriteOneToClearTest(unittest.TestCase):
+    """IRQSTAT is write-1-to-clear: acking CC must leave TC set for a poll."""
+
+    def test_store_of_cc_clears_cc_only(self):
+        from emu.esdhc import CC, IRQSTAT, TC
+        machine = FakeMachine()
+        esd = Esdhc(machine, card=Card(image=bytes(512)))
+        esd._set_bits(IRQSTAT, CC | TC)
+        # the guest's `move.l #1, IRQSTAT`: the hook first, then the store lands
+        esd._on_irqstat_write(machine.uc, None, BASE + IRQSTAT, 4, CC, None)
+        put32(machine.uc, BASE + IRQSTAT, CC)
+        esd._on_irqstat_read(machine.uc, None, BASE + IRQSTAT, 4, 0, None)
+        self.assertEqual(get32(machine.uc, BASE + IRQSTAT), TC)
+
+    def test_byte_store_and_model_set_after_it(self):
+        from emu.esdhc import CC, IRQSTAT, TC
+        machine = FakeMachine()
+        esd = Esdhc(machine, card=Card(image=bytes(512)))
+        esd._set_bits(IRQSTAT, CC | TC)
+        # a byte store of 0x03 to the low byte clears CC and TC
+        esd._on_irqstat_write(machine.uc, None, BASE + IRQSTAT + 3, 1, CC | TC, None)
+        machine.uc.mem_write(BASE + IRQSTAT + 3, bytes([CC | TC]))
+        esd._set_bits(IRQSTAT, TC)        # the next command, before any read
+        esd._on_irqstat_read(machine.uc, None, BASE + IRQSTAT, 4, 0, None)
+        self.assertEqual(get32(machine.uc, BASE + IRQSTAT), TC)

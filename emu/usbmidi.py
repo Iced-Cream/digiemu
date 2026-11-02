@@ -121,6 +121,15 @@ class UsbMidi:
         with self._lock:
             return len(self._packets)
 
+    @property
+    def idle(self):
+        """No host input waiting, and no transfer of ours in the guest's
+        hands: the moment a snapshot can be taken, as a post leaves a call
+        frame on the guest stack that only this object knows about."""
+        with self._lock:
+            return not self._packets and not self._busy and not self._calls \
+                and self._parsing is None
+
     def install(self, m, at, profile, ev=None):
         """Hook the senders and the idle spins. -> False (and nothing
         installed) when this image lacks any of the addresses.

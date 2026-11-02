@@ -303,6 +303,11 @@ def run(snapshot, syx, args, link, current, stop):
     din_in = din_out = None
     if current.get('din_link') is not None:
         din_in, din_out = midi.MidiIn(), midi.MidiOut(current['din_link'].send)
+        # Headless runs slower than real time for minutes (65% with Overbridge audio), and
+        # MidiIn's host-to-emulated mapping sinks only 50 ms a second: each byte then lands
+        # further in the emulated future, 20 s and more after a minute or two. Let it follow
+        # a clock that falls behind; no audio cushion bursts ahead here.
+        din_in.DECAY = 1.0
         din_out.install(m)
     din = tuple(x for x in (din_in, din_out) if x is not None)
 

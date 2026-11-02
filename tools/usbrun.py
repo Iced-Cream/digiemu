@@ -18,6 +18,15 @@ snapshot that carries the audio model is opened with it, muted.
                                   [--save-on-exit PATH] [--no-realtime]
                                   [--firmware SYX|DIR]
 
+With --stdin-commands it reads commands from stdin, one per line, between
+two steps of the machine:
+
+    save [PATH]   wait until no USB MIDI input is waiting or in flight, flush
+                  the +Drive, save the machine to PATH (default --save-to)
+                  and copy the flushed card beside it as PATH.card; then
+                  print "[usbrun] saved PATH". The two files are a pair: open
+                  PATH with DT2_PLUSDRIVE pointing at a copy of PATH.card.
+
 An OS upgrade sent over the link runs as on the unit (emu/osupgrade.py): the
 OS writes the new container into the emulated SPI flash and resets, and the
 runner then boots that flash through the bootstrap and the updater, the
@@ -31,19 +40,49 @@ FirmwarePaths.env()). Ctrl-C stops it cleanly: the card is flushed and, with
 """
 import argparse
 import os
+import queue
 import signal
 import sys
+import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from emu import config, device as devices, obaudio, osupgrade, panel, symbols, usbmidi
+from emu import config, device as devices, obaudio, osupgrade, panel, sparse, symbols, usbmidi
 from emu.dtim import Dtims, Timers
 from emu.longrun import build, never_fake_set_posts, spin
 from emu.pit import INSTR_PER_SEC, Pits, intro_running
 from emu.snapshot import _SnapshotUnpickler, save as save_snapshot
 
 BUDGET = 400_000
+CHUNK = 1 << 20
+
+
+def copy_card(src, dst):
+    """Copy a card image, leaving its all-zero megabytes as holes (the
+    +Drive is mostly empty, and a plain copy would allocate all of it).
+    Written to dst.tmp and renamed over dst."""
+    tmp = dst + '.tmp'
+    zero = bytes(CHUNK)
+    with open(src, 'rb') as fi, open(tmp, 'wb') as fo:
+        sparse.make_sparse(fo)
+        size = 0
+        for chunk in iter(lambda: fi.read(CHUNK), b''):
+            if chunk == zero[:len(chunk)]:
+                fo.seek(len(chunk), os.SEEK_CUR)
+            else:
+                fo.write(chunk)
+            size += len(chunk)
+        fo.truncate(size)
+    os.replace(tmp, dst)
+
+
+def read_commands(stream, out):
+    """Each line of `stream` onto the queue `out`, until it ends."""
+    for line in stream:
+        line = line.strip()
+        if line:
+            out.put(line)
 
 
 def saved_manifest(path):
@@ -138,6 +177,10 @@ def main(argv=None):
     ap.add_argument('--seconds', type=float, default=0,
                     help='stop after this much emulated time (0: run until Ctrl-C)')
     ap.add_argument('--save-on-exit')
+    ap.add_argument('--stdin-commands', action='store_true',
+                    help='read commands from stdin, one per line (save [PATH])')
+    ap.add_argument('--save-to', metavar='PATH',
+                    help='where a save command with no PATH saves the machine')
     ap.add_argument('--no-realtime', action='store_true',
                     help='run as fast as the host can instead of pacing to real time')
     ap.add_argument('--report', type=float, default=10.0,
@@ -161,6 +204,11 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     current = {'usb': None}
+    if args.stdin_commands:
+        current['commands'] = queue.Queue()
+        threading.Thread(target=read_commands, args=(sys.stdin, current['commands']),
+                         daemon=True).start()
+        print('[usbrun] commands on stdin: save', flush=True)
 
     def put(data):
         usb = current['usb']
@@ -277,7 +325,43 @@ def run(snapshot, syx, args, link, current, stop):
     t0 = last = time.time()
     instrs = 0
     status = 'limit'
+    waiting = []                    # a command that waits for its moment
+
+    def save(path=None):
+        """-> True when done (or failed), False to try again next step."""
+        path = path or args.save_to
+        if not path:
+            print('[usbrun] save failed: no PATH and no --save-to', flush=True)
+            return True
+        if not usb.idle:
+            return False            # a transfer's call frame is on the guest stack
+        try:
+            esd = ev.get('esdhc')
+            if esd is not None:
+                esd.card.flush()
+            save_session(m, ev, st, pits, instrs, path, 'saved on command by tools/usbrun.py')
+            card = os.environ.get('DT2_PLUSDRIVE')
+            if esd is not None and card:
+                copy_card(card, path + '.card')
+        except Exception as exc:                        # noqa: BLE001
+            print('[usbrun] save failed: %s' % exc, flush=True)
+            return True
+        print('[usbrun] saved %s' % path, flush=True)
+        return True
+    commands = {'save': save}
     while not stop['now']:
+        q = current.get('commands')
+        while q is not None and not waiting and not q.empty():
+            words = q.get().split(None, 1)
+            if words[0] in commands:
+                waiting.append((commands[words[0]], words[1:]))
+            else:
+                print('[usbrun] unknown command: %s' % words[0], flush=True)
+        if waiting:
+            took = time.time()
+            if waiting[0][0](*waiting[0][1]):
+                waiting.pop(0)
+            t0 += time.time() - took    # a save's seconds are not emulated time
         ips = pits.sources[0].ips
         pc, executed, status = spin(m, pc, max(BUDGET, ips // 200), pits=pits,
                                     fast=True, async_events=audio + (usb,))
@@ -318,22 +402,28 @@ def run(snapshot, syx, args, link, current, stop):
     if esd is not None:
         esd.card.flush()
     if args.save_on_exit and status == 'limit':
-        components = ev['checkpoint_components']
-        if components.get('timers') is not pits:
-            ev['claim_checkpoint_component']('timers', pits)
-        tasks = {'%#010x' % tcb: info
-                 for tcb, info in st.get('task_create_hits', {}).items()}
-        tasks.update(('%#010x' % tcb, {'entry': e, 'prio': p, 'tcb': tcb})
-                     for e, p, tcb in ev.get('tasks', []))
-        tmp = args.save_on_exit + '.tmp'
-        save_snapshot(m, tmp, extra={'n': st.get('n', 0) + instrs, 'tasks': tasks,
-                                     'note': 'saved on exit by tools/usbrun.py'},
-                      components=components, manifest=ev.get('checkpoint_manifest'))
-        os.replace(tmp, args.save_on_exit)
+        save_session(m, ev, st, pits, instrs, args.save_on_exit, 'saved on exit by tools/usbrun.py')
         print('[usbrun] session saved to %s' % args.save_on_exit, flush=True)
     if status != 'reset':
         print('[usbrun] stopped; %s' % usb.report(), flush=True)
     return status, flash
+
+
+def save_session(m, ev, st, pits, instrs, path, note):
+    """Save the machine at a step boundary to `path` (via path.tmp), as the
+    window saves its session; the card is not in it (emu/gui.py
+    _save_session), so flush it first."""
+    components = ev['checkpoint_components']
+    if components.get('timers') is not pits:
+        ev['claim_checkpoint_component']('timers', pits)
+    tasks = {'%#010x' % tcb: info
+             for tcb, info in st.get('task_create_hits', {}).items()}
+    tasks.update(('%#010x' % tcb, {'entry': e, 'prio': p, 'tcb': tcb})
+                 for e, p, tcb in ev.get('tasks', []))
+    tmp = path + '.tmp'
+    save_snapshot(m, tmp, extra={'n': st.get('n', 0) + instrs, 'tasks': tasks, 'note': note},
+                  components=components, manifest=ev.get('checkpoint_manifest'))
+    os.replace(tmp, path)
 
 
 if __name__ == '__main__':

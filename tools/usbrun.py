@@ -198,7 +198,7 @@ def main(argv=None):
                          'file the flash was written from (the running one is '
                          'always a candidate)')
     ap.add_argument('--workdir', metavar='DIR',
-                    help='where a reboot builds its firmware folder (default: '
+                    help='where reboots build their firmware folders, DIR/N for boot N (default: '
                          'reboots/N beside the running firmware folder)')
     ap.add_argument('--no-reboot', action='store_true',
                     help='stop when the OS resets instead of booting the flash')
@@ -254,7 +254,9 @@ def main(argv=None):
             with open(os.path.join(config.sections_dir(),
                                    'section_2_DSP.bin'), 'rb') as fh:
                 boot_section = fh.read()
-            workdir = args.workdir or os.path.join(
+            # A folder per boot: the reboot rebuilds its folder from scratch, and the
+            # card the running OS has just written may be in the previous boot's.
+            workdir = os.path.join(args.workdir, str(boots)) if args.workdir else os.path.join(
                 os.path.dirname(os.path.dirname(os.path.abspath(old_syx))),
                 'reboots', str(boots))
             print('[usbrun] %s %s' % ('switching on again into' if status == 'power-off'
